@@ -605,11 +605,11 @@ def argument_parser():
                    type=eng_float, default="915.0M")  # XY: eng_float is the float in engineering format
     p.add_argument("-g", "--gain", dest="gain",
                    type=eng_float, default="10.0")
-    p.add_argument("-sf", "--SF", dest="Spreading Factor",
+    p.add_argument("-sf", "--SF", dest="SF",
                    type=int, default="7")
-    p.add_argument("-cr", "--CR", dest="Coding Rate",
+    p.add_argument("-cr", "--CR", dest="CR",
                    type=int, default="1")
-    p.add_argument("-preamble", "--preamble", dest="Preamble Length",
+    p.add_argument("-preamble", "--preamble", dest="preamble",
                    type=int, default="8")
     p.add_argument("-s", "--samp-rate", dest="samp_rate",
                    type=eng_float, default="250.0k")
