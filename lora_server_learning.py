@@ -123,7 +123,7 @@ class MADDPGPolicy:
         # Previous-slot measurements for g(t+1) approximation in obs
         self._prev_rssi_dbm = np.full(n_agents, -100.0)
         self._prev_snr_db = np.full(n_agents, 0.0)
-        self._prev_noise_dbfs = np.full(n_agents,  -60.0)
+        # self._prev_noise_dbfs = np.full(n_agents,  -60.0)
 
         # Threading
         self._lock = threading.Lock()
@@ -357,7 +357,7 @@ class MADDPGPolicy:
         # Advance previous-slot buffers
         self._prev_rssi_dbm = rssi_now.copy()
         self._prev_snr_db = snr_db.copy()
-        self._prev_noise_dbfs = noise_now.copy()
+        # self._prev_noise_dbfs = noise_now.copy()
 
         return obs_list_, state_
 

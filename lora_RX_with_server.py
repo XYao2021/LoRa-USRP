@@ -462,7 +462,7 @@ class lora_RX(gr.top_block):
     def __init__(self, center_freq=915000000, gain=10, samp_rate=250000,
                  noise_figure_db=6.0, detect_margin_db=DETECT_MARGIN_DB,
                  print_interval=5.0, payload_len=21,
-                 server_host='127.0.0.1', server_port=None,
+                 server_host='127.0.0.1', server_port=None, SF=7, CR=1, preamble=8,
                  agent_id=0):
 
         gr.top_block.__init__(self, f"LoRa RX{agent_id}")
@@ -476,15 +476,15 @@ class lora_RX(gr.top_block):
         if server_port is None:
             server_port = RX_PORT_BASE + agent_id
 
-        sf = 7
+        sf = SF
         impl_head = False
         has_crc = True
-        cr = 1
+        cr = CR
         bw = samp_rate
         sync_word = [0x12]
         ldro_mode = 2
         os_factor = 8
-        preamble_len = 8
+        preamble_len = preamble
 
         serial, antenna = RX_SERIALS.get(agent_id, ("30CD3F7", "RX2"))
 
@@ -602,9 +602,15 @@ class lora_RX(gr.top_block):
 def argument_parser():
     p = ArgumentParser(description="LoRa RX — MADDPG slot control")
     p.add_argument("-f", "--center-freq", dest="center_freq",
-                   type=eng_float, default="915.0M")
+                   type=eng_float, default="915.0M")  # XY: eng_float is the float in engineering format
     p.add_argument("-g", "--gain", dest="gain",
                    type=eng_float, default="10.0")
+    p.add_argument("-sf", "--SF", dest="Spreading Factor",
+                   type=int, default="7")
+    p.add_argument("-cr", "--CR", dest="Coding Rate",
+                   type=int, default="1")
+    p.add_argument("-preamble", "--preamble", dest="Preamble Length",
+                   type=int, default="8")
     p.add_argument("-s", "--samp-rate", dest="samp_rate",
                    type=eng_float, default="250.0k")
     p.add_argument("-n", "--noise-figure", dest="noise_figure_db",
@@ -638,6 +644,9 @@ def main(options=None):
         payload_len=options.payload_len,
         server_host=options.server_host,
         server_port=options.server_port,
+        SF=options.SF,
+        CR=options.CR,
+        preamble=options.preamble,
         agent_id=options.agent_id,
     )
 

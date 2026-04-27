@@ -230,7 +230,7 @@ class lora_TX(gr.top_block):
 
     def __init__(self, center_freq=915000000, gain=30, samp_rate=250000,
                  user_message="hello world", frame_period=1000,
-                 server_host='127.0.0.1', server_port=None,
+                 server_host='127.0.0.1', server_port=None, SF=7, CR=1, preamble=8,
                  agent_id=0):
 
         gr.top_block.__init__(self, f"LoRa TX{agent_id}")
@@ -244,14 +244,14 @@ class lora_TX(gr.top_block):
         if server_port is None:
             server_port = TX_PORT_BASE + agent_id
 
-        sf = 7
+        sf = SF
         impl_head = False
         has_crc = True
-        cr = 1
-        bw = 250000
+        cr = CR
+        bw = samp_rate
         sync_word = [0x12]
         frame_zero_padd = 2**7
-        preamble_len = 8
+        preamble_len = preamble
 
         serial = TX_SERIALS.get(agent_id, "30CD424")
 
@@ -342,6 +342,12 @@ def argument_parser():
     p.add_argument("-p", "--period", dest="frame_period",
                    type=int, default=1000,
                    help="ms between packets within a burst (default 1000)")
+    p.add_argument("-sf", "--SF", dest="Spreading Factor",
+                   type=int, default="7")
+    p.add_argument("-cr", "--CR", dest="Coding Rate",
+                   type=int, default="1")
+    p.add_argument("-preamble", "--preamble", dest="Preamble Length",
+                   type=int, default="8")
     p.add_argument("--server",   dest="server_host", default="127.0.0.1")
     p.add_argument("--port",     dest="server_port", type=int, default=None,
                    help="Override server port (default: 5555 + agent-id)")
@@ -362,6 +368,9 @@ def main(options=None):
         frame_period=options.frame_period,
         server_host=options.server_host,
         server_port=options.server_port,
+        SF=options.SF,
+        CR=options.CR,
+        preamble=options.preamble,
         agent_id=options.agent_id,
     )
 
