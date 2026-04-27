@@ -606,12 +606,14 @@ class TrainingOrchestrator:
 
     def __init__(self, tx_nodes: list, rx_nodes: list,
                  policy: MADDPGPolicy,
-                 n_slots: int, n_packets: int):
+                 n_slots: int, n_packets: int,
+                 period_ms: int = 1000):
         self.tx_nodes = tx_nodes    # list[NodeConnection], len = n_agents
         self.rx_nodes = rx_nodes    # list[NodeConnection], len = n_agents
         self.policy = policy
         self.n_slots = n_slots
         self.n_packets = n_packets
+        self.period_ms = period_ms  # ms between packets — passed to TX and RX
         self.n_agents = len(tx_nodes)
         self._stop = threading.Event()
         self._thread = None
@@ -635,7 +637,8 @@ class TrainingOrchestrator:
         n = self.n_agents
         print(f"\n{'═'*66}")
         print(f"  MADDPG + Lyapunov  n_agents={n}  "
-              f"slots={self.n_slots}  pkts/slot={self.n_packets}")
+              f"slots={self.n_slots}  pkts/slot={self.n_packets}  "
+              f"period_ms={self.period_ms}")
         print(f"  actor_dim={self.policy.actor_dim}  "
               f"critic_dim={self.policy.critic_dim}")
         print(f"{'═'*66}\n")
@@ -694,12 +697,15 @@ class TrainingOrchestrator:
         actions = self.policy.choose_action(obs_list)  # list[n] in dB
 
         # ── PHASE A: send start to ALL RX FIRST ──────────────────────────────
+        # period_ms tells RX how long to wait before timing out collection
         print("[ORCH] Phase A — start → all RX")
         for i, rx in enumerate(self.rx_nodes):
             try:
                 rx.send({"cmd": "start", "n_packets": self.n_packets,
+                         "period_ms": self.period_ms,
                          "slot": t, "agent_id": i, "timestamp": ts})
-                print(f"[ORCH → RX{i}] start  n_packets={self.n_packets}")
+                print(f"[ORCH → RX{i}] start  "
+                      f"n_packets={self.n_packets}  period_ms={self.period_ms}")
             except OSError as e:
                 print(f"[ORCH] RX{i} send error: {e} — skipping slot {t+1}")
                 return False
@@ -713,13 +719,16 @@ class TrainingOrchestrator:
                 return False
 
         # ── PHASE B: send gain to ALL TX ──────────────────────────────────────
+        # period_ms tells TX how long to wait between packets within the burst
         print("[ORCH] Phase B — gain → all TX")
         for i, tx in enumerate(self.tx_nodes):
             try:
                 tx.send({"cmd": "set_gain", "gain": actions[i],
                          "n_packets": self.n_packets,
+                         "period_ms": self.period_ms,
                          "slot": t, "agent_id": i, "timestamp": ts})
-                print(f"[ORCH → TX{i}] set_gain={actions[i]} dB")
+                print(f"[ORCH → TX{i}] set_gain={actions[i]} dB  "
+                      f"period_ms={self.period_ms}")
             except OSError as e:
                 print(f"[ORCH] TX{i} send error: {e} — skipping slot {t+1}")
                 return False
@@ -735,14 +744,20 @@ class TrainingOrchestrator:
         print(f"[ORCH] All {n} TX + {n} RX ready — slot {t+1} active")
 
         # ── PHASE C: wait for burst_done from all TX ──────────────────────────
-        burst_to = self.n_packets * 2.0 + 15.0
+        # Timeout = full burst duration + margin
+        burst_to = self.n_packets * (self.period_ms / 1000.0) + 30.0
+        n_sent = {}   # agent_id → actual n_sent reported by TX (for PER)
         for i, tx in enumerate(self.tx_nodes):
             try:
                 dm = tx.wait_for_message("status", "burst_done",
                                          timeout=burst_to)
-                print(f"[ORCH] TX{i} burst_done  n_sent={dm.get('n_sent','?')}")
+                n_sent[i] = int(dm.get('n_sent', self.n_packets))
+                print(f"[ORCH] TX{i} burst_done  "
+                      f"n_sent={n_sent[i]}/{self.n_packets}")
             except TimeoutError:
-                print(f"[ORCH] TX{i} burst_done timeout — continuing")
+                n_sent[i] = self.n_packets   # assume all sent
+                print(f"[ORCH] TX{i} burst_done timeout — "
+                      f"assuming n_sent={self.n_packets}")
 
         # ── PHASE D: wait for report from all RX ──────────────────────────────
         print("[ORCH] Phase D — waiting for all RX reports ...")
@@ -751,17 +766,25 @@ class TrainingOrchestrator:
             try:
                 rep = rx.wait_for_message("type", "report",
                                           timeout=REPORT_TIMEOUT)
-                rep['agent_id'] = i
+                rep['agent_id']     = i
                 rep['current_gain'] = actions[i]
+                rep['n_sent']       = n_sent.get(i, self.n_packets)
                 reports.append(rep)
+                n_rx  = rep.get('n_packets', 0)
+                n_tx  = rep.get('n_sent',    self.n_packets)
+                per   = rep.get('per',  (n_tx - n_rx) / max(n_tx, 1))
+                gput  = rep.get('goodput', n_rx / max(n_tx, 1))
                 print(f"[ORCH] RX{i} report  "
-                      f"n={rep.get('n_packets','?')}  "
+                      f"rx={n_rx}/{n_tx}  PER={per:.3f}  goodput={gput:.3f}  "
                       f"rssi={rep.get('avg_rssi_dbm','?')} dBm  "
                       f"snr={rep.get('avg_snr_db','?')} dB")
             except TimeoutError:
                 print(f"[ORCH] RX{i} report timeout — inserting null report")
                 reports.append({
-                    "type": "report", "agent_id": i, "n_packets": 0,
+                    "type": "report", "agent_id": i,
+                    "n_packets": 0, "n_expected": self.n_packets,
+                    "n_sent": n_sent.get(i, self.n_packets),
+                    "per": 1.0, "goodput": 0.0,
                     "avg_rssi_dbm": -100.0, "avg_snr_db": 0.0,
                     "noise_floor_dbfs": -60.0, "current_gain": actions[i],
                 })
@@ -774,7 +797,12 @@ class TrainingOrchestrator:
 
         print(f"\n[ORCH] Slot {t+1} summary:")
         for i in range(n):
+            n_rx  = reports[i].get('n_packets', 0)
+            n_tx  = reports[i].get('n_sent',    self.n_packets)
+            per   = reports[i].get('per',   (n_tx - n_rx) / max(n_tx, 1))
+            gput  = reports[i].get('goodput', n_rx / max(n_tx, 1))
             print(f"  Agent {i}: gain={actions[i]:5.1f} dB  "
+                  f"rx={n_rx}/{n_tx}  PER={per:.3f}  goodput={gput:.3f}  "
                   f"rssi={reports[i].get('avg_rssi_dbm','?'):>8}  "
                   f"snr={reports[i].get('avg_snr_db','?'):>7}  "
                   f"rwd={rwd_list[i]:>+10.4f}")
@@ -822,6 +850,7 @@ class LoRaServer:
         self.auto_mode = auto_mode
         self.n_slots = n_slots
         self.n_packets = n_packets
+        self.period_ms = 1000        # ms between packets; override with --period-ms
 
         # One NodeConnection per agent for TX and RX
         self.tx_nodes = [
@@ -863,7 +892,8 @@ class LoRaServer:
         for i in range(self.n_agents):
             print(f"  Agent {i}: TX port {TX_PORT_BASE+i}  "
                   f"RX port {RX_PORT_BASE+i}")
-        print(f"  Slots={self.n_slots}  Pkts/slot={self.n_packets}")
+        print(f"  Slots={self.n_slots}  Pkts/slot={self.n_packets}  "
+              f"period_ms={self.period_ms}")
         print(f"  actor_dim={self.policy.actor_dim}  "
               f"critic_dim={self.policy.critic_dim}")
         print(f"  Auto={self.auto_mode}")
@@ -878,6 +908,7 @@ class LoRaServer:
             tx_nodes=self.tx_nodes, rx_nodes=self.rx_nodes,
             policy=self.policy,
             n_slots=self.n_slots, n_packets=self.n_packets,
+            period_ms=self.period_ms,
         )
         self._orch.start_async()
         print("[SERVER] Training loop started")
@@ -889,6 +920,7 @@ class LoRaServer:
             "\n  stop             interrupt training loop"
             "\n  slots <N>        set number of training slots"
             "\n  packets <N>      set packets per slot"
+            "\n  period <ms>      set ms between packets (use 4000+ for SF12)"
             "\n  connections      show node connection status"
             "\n  lyapunov         show Lyapunov queue values"
             "\n  status           show latest step"
@@ -934,6 +966,12 @@ class LoRaServer:
                 try:
                     self.n_packets = int(parts[1])
                     print(f"n_packets={self.n_packets}")
+                except ValueError:
+                    print("Invalid")
+            elif cmd == 'period' and len(parts) == 2:
+                try:
+                    self.period_ms = int(parts[1])
+                    print(f"period_ms={self.period_ms} ms")
                 except ValueError:
                     print("Invalid")
             elif cmd == 'connections':
@@ -992,6 +1030,9 @@ def argument_parser():
                    help="Start training loop on launch")
     p.add_argument("--slots",              type=int,   default=50)
     p.add_argument("--n-packets",          type=int,   default=10)
+    p.add_argument("--period-ms",          type=int,   default=1000,
+                   help="ms between packets within a burst "
+                        "(default 1000, use 4000+ for SF12)")
     # MADDPG
     p.add_argument("--batch-size",         type=int,   default=64)
     p.add_argument("--buffer-size",        type=int,   default=500_000)
@@ -1022,7 +1063,7 @@ def argument_parser():
 def main():
     opt = argument_parser().parse_args()
     os.makedirs(opt.chkpt_dir, exist_ok=True)
-    LoRaServer(
+    server = LoRaServer(
         host=opt.host,
         n_agents=opt.n_agents,
         auto_mode=opt.auto,
@@ -1042,7 +1083,9 @@ def main():
         power_max_dBm=opt.power_max_dBm,
         P_avg_dBm=opt.P_avg_dBm,
         g_max=opt.g_max, W=opt.W,
-    ).start()
+    )
+    server.period_ms = opt.period_ms
+    server.start()
 
 
 if __name__ == '__main__':
