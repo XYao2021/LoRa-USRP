@@ -775,6 +775,20 @@ class TrainingOrchestrator:
                 print(f"[ORCH] TX{i} burst_done timeout — "
                       f"assuming n_sent={self.n_packets}")
 
+        # ── PHASE C+: release all RX collectors immediately ───────────────────
+        # Sent right after all TX burst_done are collected.
+        # This unblocks any RX that received zero matching packets — they would
+        # otherwise block in wait_complete() for the full 60s timeout before
+        # reporting. With 'release' they respond within milliseconds.
+        print("[ORCH] Phase C+ — release → all RX")
+        for i, rx in enumerate(self.rx_nodes):
+            try:
+                rx.send({"cmd": "release", "slot": t,
+                         "timestamp": datetime.now().isoformat()})
+                print(f"[ORCH → RX{i}] release")
+            except OSError as e:
+                print(f"[ORCH] RX{i} release send error: {e}")
+
         # ── PHASE D: wait for report from all RX ──────────────────────────────
         print("[ORCH] Phase D — waiting for all RX reports ...")
         reports = []

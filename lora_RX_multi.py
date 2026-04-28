@@ -194,6 +194,19 @@ class SlotCollector(gr.basic_block):
     def wait_complete(self, timeout: float) -> bool:
         return self._done_ev.wait(timeout=timeout)
 
+    def release(self):
+        """
+        Force-complete the current slot immediately.
+        Called by ServerCommandHandler when it receives a 'release' command
+        from the server (sent after all TX report burst_done).
+        Any packets collected so far are included in the report; if none
+        were collected the report will contain noise floor measurements.
+        """
+        with self._lock:
+            self._armed = False
+        self._done_ev.set()
+        print(f"[RX{self.agent_id}] Collector released by server")
+
     def get_report(self) -> dict:
         with self._lock:
             records    = list(self._records)
@@ -421,9 +434,8 @@ class ServerCommandHandler:
         if c == 'start':
             n_packets = int(cmd.get('n_packets', 10))
             slot      = cmd.get('slot', -1)
-            # period_ms tells us how long TX waits between packets
-            # Use it to compute a realistic collection timeout
             period_ms = int(cmd.get('period_ms', 1000))
+            n_agents  = int(cmd.get('n_agents',  1))
 
             self.collector.arm(n_packets, slot)
 
@@ -435,24 +447,42 @@ class ServerCommandHandler:
             }, conn)
             print(f"[RX{self.agent_id}] ready  slot={slot}")
 
-            # Timeout = single burst duration + 60s margin.
-            # start_delay_ms=0 for all agents so all TX fire simultaneously;
-            # the full slot window is n_packets * period_ms.
-            n_agents = int(cmd.get('n_agents', 1))
-            timeout  = n_packets * (period_ms / 1000.0) + 60.0
-            done    = self.collector.wait_complete(timeout=timeout)
+            # ── Wait and report in a background thread ────────────────────────
+            # _recv_loop must stay unblocked so it can receive the 'release'
+            # command from the server while collection is still in progress.
+            # If _handle blocked here, 'release' would sit unread in the TCP
+            # buffer until wait_complete() timed out — which is the exact bug
+            # that caused RX1 (receiving nothing) to be silent for 60+ seconds.
+            timeout = n_packets * (period_ms / 1000.0) + 60.0
 
-            if not done:
-                print(f"[RX{self.agent_id}] Timeout — reporting partial data")
+            def _wait_and_report():
+                done = self.collector.wait_complete(timeout=timeout)
+                if not done:
+                    print(f"[RX{self.agent_id}] Timeout — "
+                          f"reporting partial/noise data")
+                report = self.collector.get_report()
+                self._send(report, conn)
+                print(f"[RX{self.agent_id}] report  "
+                      f"n_received={report['n_packets']}"
+                      f"/{report['n_expected']}  "
+                      f"PER={report['per']:.3f}  "
+                      f"goodput={report['goodput']:.3f}  "
+                      f"rssi={report['avg_rssi_dbm']} dBm  "
+                      f"snr={report['avg_snr_db']} dB  "
+                      f"source={report.get('source', 'packet')}")
 
-            report = self.collector.get_report()
-            self._send(report, conn)
-            print(f"[RX{self.agent_id}] report  "
-                  f"n_received={report['n_packets']}/{report['n_expected']}  "
-                  f"PER={report['per']:.3f}  "
-                  f"goodput={report['goodput']:.3f}  "
-                  f"rssi={report['avg_rssi_dbm']} dBm  "
-                  f"snr={report['avg_snr_db']} dB")
+            threading.Thread(target=_wait_and_report, daemon=True,
+                             name=f"RX{self.agent_id}-slot{slot}").start()
+
+        elif c == 'release':
+            # Server sends this after all TX report burst_done.
+            # Unblocks _wait_and_report immediately so the report is sent
+            # without waiting for the full timeout.
+            # RX with zero matching packets returns noise floor measurements.
+            slot = cmd.get('slot', -1)
+            print(f"[RX{self.agent_id}] ← release  slot={slot} "
+                  f"— forcing report now")
+            self.collector.release()
 
         elif c == 'stop':
             print(f"[RX{self.agent_id}] Stop — shutting down")
