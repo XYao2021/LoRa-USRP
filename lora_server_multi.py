@@ -692,9 +692,17 @@ class TrainingOrchestrator:
         print(f"{'─'*66}")
 
         # ── 1. Policy chooses one gain per agent ──────────────────────────────
+        # Change 3: For slot 0 all transmitters start at the maximum gain
+        # (89.5 dB) so the first observation is collected at full power.
+        # From slot 1 onward the MADDPG policy controls the gain.
         obs_list = self.policy._obs_list
-        state = self.policy._state
-        actions = self.policy.choose_action(obs_list)  # list[n] in dB
+        state    = self.policy._state
+        if t == 0:
+            actions = [89.5] * n
+            print(f"[ORCH] Slot 0 — using initial gain {actions[0]} dB "
+                  f"for all {n} agents")
+        else:
+            actions = self.policy.choose_action(obs_list)  # list[n] in dB
 
         # ── PHASE A: send start to ALL RX FIRST ──────────────────────────────
         # period_ms tells RX how long to wait before timing out collection
@@ -720,23 +728,21 @@ class TrainingOrchestrator:
                 return False
 
         # ── PHASE B: send gain to ALL TX ──────────────────────────────────────
-        # period_ms tells TX how long to wait between packets within the burst.
-        # start_delay_ms staggers agents in time so their bursts do not overlap:
-        #   Agent i starts at i * (n_packets * period_ms) ms after slot open.
-        # Combined with AGT: payload prefix filtering at RX, this gives full
-        # packet-level agent identification without FDD.
-        print("[ORCH] Phase B — gain → all TX")
+        # Change 4: start_delay_ms = 0 for all agents — all TX transmit
+        # immediately after receiving the command. Agent identification is
+        # handled entirely by the AGT: payload prefix parsed at RX.
+        # No time-staggering is applied; simultaneous transmission is accepted
+        # (capture effect or collision resolved at the LoRa physical layer).
+        print("[ORCH] Phase B — gain → all TX  [start_delay=0 for all]")
         for i, tx in enumerate(self.tx_nodes):
-            start_delay_ms = i * self.n_packets * self.period_ms
             try:
                 tx.send({"cmd": "set_gain", "gain": actions[i],
                          "n_packets": self.n_packets,
                          "period_ms": self.period_ms,
-                         "start_delay_ms": start_delay_ms,
+                         "start_delay_ms": 0,
                          "slot": t, "agent_id": i, "timestamp": ts})
                 print(f"[ORCH → TX{i}] set_gain={actions[i]} dB  "
-                      f"period_ms={self.period_ms}  "
-                      f"start_delay_ms={start_delay_ms}")
+                      f"period_ms={self.period_ms}  start_delay_ms=0")
             except OSError as e:
                 print(f"[ORCH] TX{i} send error: {e} — skipping slot {t+1}")
                 return False
@@ -752,9 +758,10 @@ class TrainingOrchestrator:
         print(f"[ORCH] All {n} TX + {n} RX ready — slot {t+1} active")
 
         # ── PHASE C: wait for burst_done from all TX ──────────────────────────
-        # Timeout covers full staggered window: last agent starts at
-        # (n-1) * n_packets * period_ms, then needs its own burst duration.
-        burst_to = self.n_agents * self.n_packets * (self.period_ms / 1000.0) + 30.0
+        # Timeout = single burst duration + margin.
+        # With start_delay_ms=0 all TX fire simultaneously so the burst
+        # window is n_packets * period_ms regardless of n_agents.
+        burst_to = self.n_packets * (self.period_ms / 1000.0) + 30.0
         n_sent = {}   # agent_id → actual n_sent reported by TX (for PER)
         for i, tx in enumerate(self.tx_nodes):
             try:
@@ -1099,3 +1106,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    

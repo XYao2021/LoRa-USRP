@@ -211,6 +211,10 @@ class SlotCollector(gr.basic_block):
             goodput = 0.0
 
         if not records:
+            # No packets decoded successfully — return noise floor measurements
+            # so the server still has a valid RSSI/SNR observation for the slot.
+            noise_floor_dbfs = self.probe.noise_floor_dbfs
+            noise_floor_dbm  = noise_floor_dbfs   # uncalibrated: dBm = dBFS + 0
             return {
                 "type"            : "report",
                 "agent_id"        : self.agent_id,
@@ -219,12 +223,13 @@ class SlotCollector(gr.basic_block):
                 "n_expected"      : n_expected,
                 "per"             : 1.0,
                 "goodput"         : 0.0,
-                "avg_rssi_dbm"    : -100.0,
+                "avg_rssi_dbfs"   : round(noise_floor_dbfs, 2),
+                "avg_rssi_dbm"    : round(noise_floor_dbm,  2),
                 "avg_snr_db"      : 0.0,
-                "avg_rssi_dbfs"   : -100.0,
-                "avg_arduino_rssi": -100.0,
+                "avg_arduino_rssi": round(noise_floor_dbm,  2),
                 "avg_arduino_snr" : 0.0,
-                "noise_floor_dbfs": self.probe.noise_floor_dbfs,
+                "noise_floor_dbfs": round(noise_floor_dbfs, 2),
+                "source"          : "noise_floor",   # flag so server knows
                 "timestamp"       : datetime.now().isoformat(),
             }
 
@@ -272,40 +277,34 @@ class SlotCollector(gr.basic_block):
         except Exception as e:
             payload = f"<err:{e}>"
 
-        # ── Payload-level agent identification ────────────────────────────────
-        # TX embeds "AGT:{id} SEQ:{seq} {message}" in every packet.
-        # This works on both USRP/gr-lora_sdr and SX1276/Arduino without
-        # any RF channel separation (FDD not required).
-        #
-        # Parse AGT prefix:
         pkt_agent_id = None
         if payload.startswith("AGT:"):
             try:
-                # Format: "AGT:0 SEQ:00001 hello world"
                 parts        = payload.split(" ", 2)
-                pkt_agent_id = int(parts[0][4:])   # int after "AGT:"
+                pkt_agent_id = int(parts[0][4:])
             except (ValueError, IndexError):
                 pkt_agent_id = None
 
         if pkt_agent_id is None:
-            # No AGT prefix — legacy packet, accept it (single-agent fallback)
+            # No AGT prefix — legacy packet, accept (single-agent fallback)
+            # Do NOT print RSSI/SNR yet; fall through to measurement below
             print(f"[RX{self.agent_id}] No AGT prefix — accepting: {payload!r}")
         elif pkt_agent_id != self.agent_id:
-            # Packet from a different TX — discard silently (log only)
+            # Wrong agent — discard WITHOUT measuring or printing RSSI/SNR
             print(f"[RX{self.agent_id}] Discarding packet from "
                   f"agent {pkt_agent_id}: {payload!r}")
             return
 
-        # ── Measurements at decode instant ────────────────────────────────────
-        rssi_dbfs    = self.probe.signal_rssi_dbfs
-        rssi_dbm     = self.probe.signal_rssi_dbm
-        snr_db       = self.probe.raw_snr_db
-        noise_dbfs   = self.probe.noise_floor_dbfs
+        # ── Measurements — only reached after AGT match (or no-prefix fallback) ─
+        # RSSI and SNR are read and printed only for packets that belong to
+        # this receiver's agent_id. Packets from other agents are returned
+        # above without touching the probe.
+        rssi_dbfs  = self.probe.signal_rssi_dbfs
+        rssi_dbm   = self.probe.signal_rssi_dbm
+        snr_db     = self.probe.raw_snr_db
+        noise_dbfs = self.probe.noise_floor_dbfs
 
         # Arduino SX1276 formula (Semtech AN1200.22 §3.5)
-        # SNR_dB = PacketSnr / 4;  PacketSnr = SNR_dB * 4
-        # If SNR >= 0: RSSI_dBm = -157 + (16/15) * PacketRssi
-        # If SNR <  0: RSSI_dBm = -157 + PacketRssi + SNR_dB
         pkt_rssi_reg = rssi_dbm + 157.0
         if snr_db >= 0:
             arduino_rssi = -157.0 + (16.0 / 15.0) * pkt_rssi_reg
@@ -322,6 +321,7 @@ class SlotCollector(gr.basic_block):
             "arduino_snr" : arduino_snr,
         }
 
+        # Print only after confirmed AGT match
         print(
             f"\n╔═ RX{self.agent_id} [{time.strftime('%H:%M:%S')}]  "
             f"Payload: {payload!r}"
@@ -435,12 +435,11 @@ class ServerCommandHandler:
             }, conn)
             print(f"[RX{self.agent_id}] ready  slot={slot}")
 
-            # Timeout covers the full staggered TDM window:
-            #   n_agents * n_packets * period_ms (all agents' bursts)
-            #   + 60s margin for last packet demodulation
-            # period_ms is received from server so this scales correctly.
+            # Timeout = single burst duration + 60s margin.
+            # start_delay_ms=0 for all agents so all TX fire simultaneously;
+            # the full slot window is n_packets * period_ms.
             n_agents = int(cmd.get('n_agents', 1))
-            timeout  = n_agents * n_packets * (period_ms / 1000.0) + 60.0
+            timeout  = n_packets * (period_ms / 1000.0) + 60.0
             done    = self.collector.wait_complete(timeout=timeout)
 
             if not done:
