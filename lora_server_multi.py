@@ -210,20 +210,20 @@ class MADDPGPolicy:
         raw_actions = self.maddpg_agents.choose_action(
             np.array(obs_list, dtype=np.float32))
 
-        gains = []
+        powers_watt = []
         for i in range(self.n_agents):
             tanh_val = float(raw_actions[i].item()
                              if hasattr(raw_actions[i], 'item')
                              else raw_actions[i])
             # Convert tanh → power in Watts (mirrors your lines 251-252)
             p_watts = self.P_max_W * (tanh_val + FACTOR) / (2.0 * FACTOR)
-            gain_dB = self._sim_power_to_gain_dB(p_watts)
-            gains.append(gain_dB)
+            # gain_dB = self._sim_power_to_gain_dB(p_watts)
+            powers_watt.append(p_watts)
 
         with self._lock:
             step = self._step
-        print(f"[POLICY] step={step}  choose_action → {gains} dB")
-        return gains
+        # print(f"[POLICY] step={step}  choose_action → {gains} dB")
+        return powers_watt
 
     # ─────────────────────────────────────────────────────────────────────────
     # HOOK 2 — Reward computation
@@ -231,7 +231,7 @@ class MADDPGPolicy:
     #          action_power_watt must be indexed [i];
     #          Lyapunov alpha/beta weighting added (exact match to paper)
     # ─────────────────────────────────────────────────────────────────────────
-    def _compute_rewards(self, reports: list, action_gains: list) -> list:
+    def _compute_rewards(self, reports: list, action_watts: list) -> list:
         """
         Args:
             reports     : list of n_agents report dicts from RX nodes
@@ -258,7 +258,6 @@ class MADDPGPolicy:
             # Per-agent SNR from its own RX report
             snr_db_i = float(reports[i].get('avg_snr_db', 0.0))
             sinr_lin = 10 ** (snr_db_i / 10.0)
-            p_watts_i = 1e-3 * 10 ** (action_gains[i] / 10.0)
 
             # Lyapunov alpha / beta (your lines 336-337)
             alpha = (self._H_ji[i] / h_max) * self.T_b
@@ -269,7 +268,7 @@ class MADDPGPolicy:
 
             # Reward (your line 348)
             rewards[i] = (alpha * self.W * np.log2(1 + sinr_lin)
-                          - beta * p_watts_i)
+                          - beta * action_watts[i])
 
         # Softmax ratios (your lines 367-370)
         import torch
@@ -384,7 +383,7 @@ class MADDPGPolicy:
     # HOOK 6 — Lyapunov queue update
     # BUG FIX: bare n_agents / V → self.n_agents / self.V
     # ─────────────────────────────────────────────────────────────────────────
-    def _lyapunov_update(self, action_gains: list):
+    def _lyapunov_update(self, action_watt: list):
         """
         CVXPY solve for x_optimal then queue update.
         Exact match to your lines 481-495.
@@ -418,8 +417,7 @@ class MADDPGPolicy:
 
         # ── Queue update (your lines 493-495) ─────────────────────────────────
         for i in range(n):
-            action_power_watt = ((action_gains[i] - G_min) / (G_max - G_min)) * self.P_max_W
-            self._Z_i[i] = max(self._Z_i[i] + self.T_f * action_power_watt
+            self._Z_i[i] = max(self._Z_i[i] + self.T_f * action_watt[i]
                                 - self.T_f * self.P_avg_W,   0.0)
             self._H_ji[i] = max(self._H_ji[i] + x_optimal[i]
                                 - self._X_ji[i],             0.0)
@@ -698,9 +696,9 @@ class TrainingOrchestrator:
         obs_list = self.policy._obs_list
         state    = self.policy._state
         if t == 0:
-            actions = [89.5] * n
-            print(f"[ORCH] Slot 0 — using initial gain {actions[0]} dB "
-                  f"for all {n} agents")
+            actions = [self.policy.P_max_W] * n
+            # print(f"[ORCH] Slot 0 — using initial gain {actions[0]} dB "
+            #       f"for all {n} agents")
         else:
             actions = self.policy.choose_action(obs_list)  # list[n] in dB
 
@@ -734,14 +732,17 @@ class TrainingOrchestrator:
         # No time-staggering is applied; simultaneous transmission is accepted
         # (capture effect or collision resolved at the LoRa physical layer).
         print("[ORCH] Phase B — gain → all TX  [start_delay=0 for all]")
+        action_gains = []
         for i, tx in enumerate(self.tx_nodes):
+            action_gain = G_min + int((actions[i] / self.policy.P_max_W) * (G_max - G_min))
+            action_gains.append(action_gain)
             try:
-                tx.send({"cmd": "set_gain", "gain": actions[i],
+                tx.send({"cmd": "set_gain", "gain": action_gain,
                          "n_packets": self.n_packets,
                          "period_ms": self.period_ms,
                          "start_delay_ms": 0,
                          "slot": t, "agent_id": i, "timestamp": ts})
-                print(f"[ORCH → TX{i}] set_gain={actions[i]} dB  "
+                print(f"Slot {t} [ORCH → TX{i}] set_gain={action_gain} dB  "
                       f"period_ms={self.period_ms}  start_delay_ms=0")
             except OSError as e:
                 print(f"[ORCH] TX{i} send error: {e} — skipping slot {t+1}")
@@ -797,7 +798,7 @@ class TrainingOrchestrator:
                 rep = rx.wait_for_message("type", "report",
                                           timeout=REPORT_TIMEOUT)
                 rep['agent_id']     = i
-                rep['current_gain'] = actions[i]
+                rep['current_gain'] = action_gains[i]
                 rep['n_sent']       = n_sent.get(i, self.n_packets)
                 reports.append(rep)
                 n_rx  = rep.get('n_packets', 0)
@@ -816,7 +817,7 @@ class TrainingOrchestrator:
                     "n_sent": n_sent.get(i, self.n_packets),
                     "per": 1.0, "goodput": 0.0,
                     "avg_rssi_dbm": -100.0, "avg_snr_db": 0.0,
-                    "noise_floor_dbfs": -60.0, "current_gain": actions[i],
+                    "noise_floor_dbfs": -60.0, "current_gain": action_gains[i],
                 })
 
         # ── PHASE E: joint MADDPG step ────────────────────────────────────────
@@ -831,7 +832,7 @@ class TrainingOrchestrator:
             n_tx  = reports[i].get('n_sent',    self.n_packets)
             per   = reports[i].get('per',   (n_tx - n_rx) / max(n_tx, 1))
             gput  = reports[i].get('goodput', n_rx / max(n_tx, 1))
-            print(f"  Agent {i}: gain={actions[i]:5.1f} dB  "
+            print(f"  Agent {i}: gain={action_gains[i]:5.1f} dB  "
                   f"rx={n_rx}/{n_tx}  PER={per:.3f}  goodput={gput:.3f}  "
                   f"rssi={reports[i].get('avg_rssi_dbm','?'):>8}  "
                   f"snr={reports[i].get('avg_snr_db','?'):>7}  "
