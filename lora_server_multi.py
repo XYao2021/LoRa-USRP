@@ -14,7 +14,7 @@ import cvxpy as cp
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
-G_min = 0.0
+G_min = 70.0
 G_max = 89.8
 G_step = 0.2
 GAIN_CANDIDATES = np.round(np.arange(G_min, G_max, G_step), 1)
@@ -418,8 +418,8 @@ class MADDPGPolicy:
 
         # ── Queue update (your lines 493-495) ─────────────────────────────────
         for i in range(n):
-            p_watts = 1e-3 * 10 ** (action_gains[i] / 10.0)
-            self._Z_i[i] = max(self._Z_i[i] + self.T_f * p_watts
+            action_power_watt = ((action_gains[i] - G_min) / (G_max - G_min)) * self.P_max_W
+            self._Z_i[i] = max(self._Z_i[i] + self.T_f * action_power_watt
                                 - self.T_f * self.P_avg_W,   0.0)
             self._H_ji[i] = max(self._H_ji[i] + x_optimal[i]
                                 - self._X_ji[i],             0.0)
@@ -1120,4 +1120,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
