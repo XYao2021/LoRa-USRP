@@ -135,6 +135,8 @@ class MADDPGPolicy:
                           for _ in range(n_agents)]
         self._state = np.zeros(self.critic_dim, dtype=np.float32)
 
+        self.avg_rewards = []
+
         # ── Create MADDPG agents and replay buffer ────────────────────────────
         T.manual_seed(42)
         os.makedirs(chkpt_dir, exist_ok=True)
@@ -460,6 +462,8 @@ class MADDPGPolicy:
         print(f"[MADDPG] step={step:04d}  slot={slot_idx}  "
               f"gains={actions}  avg_rwd={avg_rwd:+.4f}")
 
+        self.avg_rewards.append(avg_rwd)
+
         if step % 10 == 0:
             with self._lock:
                 last50 = self._history[-min(len(self._history), 50):]
@@ -475,6 +479,9 @@ class MADDPGPolicy:
     def save_checkpoint(self):
         self.maddpg_agents.save_checkpoint()
         self.save_history()
+
+        with open("avg_rewards.txt", "w") as f:
+            f.write(str(self.avg_rewards))
 
     def load_checkpoint(self):
         self.maddpg_agents.load_checkpoint()
